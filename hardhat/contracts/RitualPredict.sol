@@ -4,16 +4,26 @@ pragma solidity ^0.8.28;
 import {RitualChain, IScheduler, IRitualWallet, ITEEServiceRegistry} from "./ritual/RitualChain.sol";
 
 /**
- * RitualPredict — a self-resolving binary prediction market.
+ * RitualPredict — a self-resolving, multi-outcome prediction market.
  *
- * Users stake native RITUAL on YES or NO. When the betting window closes, nobody
- * clicks "resolve" and no backend cron runs: the Ritual Scheduler wakes the contract
- * at a block chosen at market-creation time. The contract then calls the HTTP
- * precompile (0x0801) to read the configured oracle URL, extracts one number with the
- * jq precompile (0x0803), compares it to the target, and settles the market.
+ * Extension over the workshop starter: markets are no longer fixed to YES/NO. Each
+ * market defines a sorted `thresholds[]` array; the single number read from the oracle
+ * is bucketed against it into one of `thresholds.length + 1` outcomes. A traditional
+ * binary market is just the one-threshold special case (thresholds = [4000] gives you
+ * "below 4000" / "at or above 4000") — nothing about the oracle read, the Scheduler
+ * booking, or the retry logic changes based on outcome count.
+ *
+ * Market creation also now charges a flat CREATION_FEE, forwarded immediately to an
+ * immutable `treasury` address set at deploy time.
+ *
+ * Users stake native RITUAL on one outcome. When the betting window closes, the Ritual
+ * Scheduler wakes the contract at a block chosen at market-creation time. The contract
+ * calls the HTTP precompile (0x0801) to read the configured oracle URL, extracts one
+ * number with the jq precompile (0x0803), buckets it against the thresholds, and
+ * settles the market.
  *
  * Payouts are pari-mutuel and pull-based: each winner claims
- * `stake * totalPool / winningPool`. Nothing loops over participants.
+ * `stake * totalPool / winningOutcomePool`. Nothing loops over participants.
  *
  * Every deadline is a BLOCK NUMBER, so "betting is closed" and "the Scheduler woke us"
  * can never disagree. Human durations are converted at `blockTimeMs`, measured from the
@@ -30,19 +40,6 @@ contract RitualPredict {
         Invalid // could not be resolved (or nobody won); everyone refunds
     }
 
-    enum Comparator {
-        GT, // observed >  target
-        GTE, // observed >= target
-        LT, // observed <  target
-        LTE // observed <= target
-    }
-
-    enum Outcome {
-        Unresolved,
-        Yes,
-        No
-    }
-
     /// Storage layout *and* the shape returned by `getMarket` / `getMarkets`.
     struct Market {
         uint256 id;
@@ -51,16 +48,15 @@ contract RitualPredict {
         // ── resolution rule: fixed at creation, no setter exists ──
         string oracleUrl;
         string jsonPath;
-        uint256 target;
-        Comparator comparator;
+        uint256[] thresholds; // sorted ascending; outcomeCount == thresholds.length + 1
         uint64 closeBlock;
         uint64 resolveBlock;
         uint256 scheduleId;
         // ── mutable state ──
-        uint256 totalYes;
-        uint256 totalNo;
+        uint256[] totalPerOutcome; // length == thresholds.length + 1
         MarketState state;
-        Outcome outcome;
+        bool hasOutcome;
+        uint8 outcomeIndex;
         uint8 attempts;
         uint256 observedValue;
         string invalidReason;
@@ -72,8 +68,7 @@ contract RitualPredict {
         string question;
         string oracleUrl;
         string jsonPath;
-        uint256 target;
-        Comparator comparator;
+        uint256[] thresholds;
         uint256 bettingSeconds;
         uint256 resolveDelaySeconds;
     }
@@ -106,17 +101,28 @@ contract RitualPredict {
     uint256 public constant MIN_RESOLVE_DELAY_SECONDS = 15;
     uint256 public constant MAX_MARKET_SECONDS = 1 days;
 
+    /// thresholds.length must be in [MIN_THRESHOLDS, MAX_THRESHOLDS], giving markets
+    /// between 2 and 9 outcomes.
+    uint256 public constant MIN_THRESHOLDS = 1;
+    uint256 public constant MAX_THRESHOLDS = 8;
+
+    /// Flat fee charged at market creation, forwarded to `treasury`.
+    uint256 public constant CREATION_FEE = 0.01 ether;
+
     // ────────────────────────────── Storage ──────────────────────────────
 
     /// Assumed block time, used only to turn human durations into block counts.
     /// Ritual Chain ran ~195ms when this was written.
     uint256 public immutable blockTimeMs;
 
+    /// Where every creation fee goes. Fixed at deploy time — no setter.
+    address public immutable treasury;
+
     uint256 public marketCount;
     mapping(uint256 => Market) private _markets;
 
-    mapping(uint256 => mapping(address => uint256)) public yesStake;
-    mapping(uint256 => mapping(address => uint256)) public noStake;
+    /// marketId => outcomeIndex => account => staked amount.
+    mapping(uint256 => mapping(uint8 => mapping(address => uint256))) public stakeOf;
     mapping(uint256 => mapping(address => bool)) public settled;
 
     // ────────────────────────────── Events ───────────────────────────────
@@ -135,13 +141,17 @@ contract RitualPredict {
         uint256 indexed marketId,
         string oracleUrl,
         string jsonPath,
-        uint256 target,
-        Comparator comparator
+        uint256[] thresholds
+    );
+    event CreationFeeCollected(
+        uint256 indexed marketId,
+        address indexed treasury,
+        uint256 amount
     );
     event BetPlaced(
         uint256 indexed marketId,
         address indexed bettor,
-        bool isYes,
+        uint8 outcomeIndex,
         uint256 amount
     );
     event ResolutionAttempted(
@@ -156,7 +166,7 @@ contract RitualPredict {
     );
     event MarketResolved(
         uint256 indexed marketId,
-        Outcome outcome,
+        uint8 outcomeIndex,
         uint256 observedValue
     );
     event MarketInvalidated(uint256 indexed marketId, string reason);
@@ -184,10 +194,16 @@ contract RitualPredict {
     error BadDuration();
     error EmptyString();
     error TransferFailed();
+    error InvalidThresholds();
+    error InvalidOutcome();
+    error IncorrectFee();
+    error ZeroAddress();
 
-    constructor(uint256 blockTimeMs_) {
+    constructor(uint256 blockTimeMs_, address treasury_) {
         if (blockTimeMs_ == 0) revert BadDuration();
+        if (treasury_ == address(0)) revert ZeroAddress();
         blockTimeMs = blockTimeMs_;
+        treasury = treasury_;
 
         // Let the Scheduler call back into this contract and draw execution fees from
         // this contract's RitualWallet balance.
@@ -200,14 +216,22 @@ contract RitualPredict {
 
     /**
      * Create a market and, in the same transaction, book its own resolution with the
-     * Scheduler: `MAX_ATTEMPTS` executions starting at `resolveBlock`.
+     * Scheduler: `MAX_ATTEMPTS` executions starting at `resolveBlock`. Requires exactly
+     * CREATION_FEE, forwarded to `treasury`.
      */
     function createMarket(
         NewMarket calldata p
-    ) external returns (uint256 marketId) {
+    ) external payable returns (uint256 marketId) {
+        if (msg.value != CREATION_FEE) revert IncorrectFee();
         if (bytes(p.question).length == 0) revert EmptyString();
         if (bytes(p.oracleUrl).length == 0) revert EmptyString();
         if (bytes(p.jsonPath).length == 0) revert EmptyString();
+
+        uint256 n = p.thresholds.length;
+        if (n < MIN_THRESHOLDS || n > MAX_THRESHOLDS) revert InvalidThresholds();
+        for (uint256 i = 1; i < n; i++) {
+            if (p.thresholds[i] <= p.thresholds[i - 1]) revert InvalidThresholds();
+        }
 
         if (
             p.bettingSeconds < MIN_BETTING_SECONDS ||
@@ -228,12 +252,11 @@ contract RitualPredict {
         m.question = p.question;
         m.oracleUrl = p.oracleUrl;
         m.jsonPath = p.jsonPath;
-        m.target = p.target;
-        m.comparator = p.comparator;
+        m.thresholds = p.thresholds;
+        m.totalPerOutcome = new uint256[](n + 1);
         m.closeBlock = closeBlock;
         m.resolveBlock = resolveBlock;
         m.state = MarketState.Open;
-        m.outcome = Outcome.Unresolved;
 
         // Effects before the external Scheduler call (checks-effects-interactions).
         uint256 scheduleId = _scheduleResolution(marketId, resolveBlock);
@@ -247,30 +270,23 @@ contract RitualPredict {
             resolveBlock,
             scheduleId
         );
-        emit ResolutionRuleSet(
-            marketId,
-            p.oracleUrl,
-            p.jsonPath,
-            p.target,
-            p.comparator
-        );
+        emit ResolutionRuleSet(marketId, p.oracleUrl, p.jsonPath, p.thresholds);
+
+        emit CreationFeeCollected(marketId, treasury, msg.value);
+        _pay(treasury, msg.value);
     }
 
-    function bet(uint256 marketId, bool isYes) external payable {
+    function bet(uint256 marketId, uint8 outcomeIndex) external payable {
         Market storage m = _market(marketId);
         if (msg.value == 0) revert ZeroStake();
+        if (outcomeIndex >= m.totalPerOutcome.length) revert InvalidOutcome();
         if (m.state != MarketState.Open || block.number >= m.closeBlock)
             revert BettingClosed();
 
-        if (isYes) {
-            yesStake[marketId][msg.sender] += msg.value;
-            m.totalYes += msg.value;
-        } else {
-            noStake[marketId][msg.sender] += msg.value;
-            m.totalNo += msg.value;
-        }
+        stakeOf[marketId][outcomeIndex][msg.sender] += msg.value;
+        m.totalPerOutcome[outcomeIndex] += msg.value;
 
-        emit BetPlaced(marketId, msg.sender, isYes, msg.value);
+        emit BetPlaced(marketId, msg.sender, outcomeIndex, msg.value);
     }
 
     /**
@@ -321,19 +337,20 @@ contract RitualPredict {
             return;
         }
 
-        bool isYes = _compare(observed, m.target, m.comparator);
+        uint8 idx = _bucket(observed, m.thresholds);
         m.observedValue = observed;
-        m.outcome = isYes ? Outcome.Yes : Outcome.No;
+        m.outcomeIndex = idx;
+        m.hasOutcome = true;
 
-        uint256 winningPool = isYes ? m.totalYes : m.totalNo;
+        uint256 winningPool = m.totalPerOutcome[idx];
         if (winningPool == 0) {
-            // Pari-mutuel has no denominator when nobody backed the winning side.
-            _invalidate(m, marketId, "no stake on winning side");
+            // Pari-mutuel has no denominator when nobody backed the winning outcome.
+            _invalidate(m, marketId, "no stake on winning outcome");
             return;
         }
 
         m.state = MarketState.Resolved;
-        emit MarketResolved(marketId, m.outcome, observed);
+        emit MarketResolved(marketId, idx, observed);
 
         // Resolved early — cancel any remaining booked attempts.
         if (attempt < MAX_ATTEMPTS) {
@@ -341,8 +358,8 @@ contract RitualPredict {
         }
     }
 
-    /// A failed oracle read is never interpreted as NO. Once the booked attempts are
-    /// exhausted the market becomes refundable instead.
+    /// A failed oracle read is never interpreted as any outcome. Once the booked
+    /// attempts are exhausted the market becomes refundable instead.
     function _fail(
         Market storage m,
         uint256 marketId,
@@ -379,14 +396,17 @@ contract RitualPredict {
         _pay(msg.sender, payout);
     }
 
-    /// Reclaim the original stake from an invalid market.
+    /// Reclaim the original stake (across every outcome) from an invalid market.
     function claimRefund(uint256 marketId) external {
         Market storage m = _market(marketId);
         if (m.state != MarketState.Invalid) revert NotInvalid();
         if (settled[marketId][msg.sender]) revert AlreadySettled();
 
-        uint256 amount = yesStake[marketId][msg.sender] +
-            noStake[marketId][msg.sender];
+        uint256 amount = 0;
+        uint256 outcomes = m.totalPerOutcome.length;
+        for (uint8 i = 0; i < outcomes; i++) {
+            amount += stakeOf[marketId][i][msg.sender];
+        }
         if (amount == 0) revert NothingToClaim();
 
         settled[marketId][msg.sender] = true;
@@ -394,19 +414,23 @@ contract RitualPredict {
         _pay(msg.sender, amount);
     }
 
-    /// `stake * totalPool / winningPool`, or 0 if this account backed the losing side.
+    /// `stake * totalPool / winningOutcomePool`, or 0 if this account didn't back the
+    /// winning outcome.
     function _payout(
         Market storage m,
         uint256 marketId,
         address account
     ) private view returns (uint256) {
-        bool yesWon = m.outcome == Outcome.Yes;
-        uint256 stake = yesWon
-            ? yesStake[marketId][account]
-            : noStake[marketId][account];
-        uint256 winningPool = yesWon ? m.totalYes : m.totalNo;
+        uint8 idx = m.outcomeIndex;
+        uint256 stake = stakeOf[marketId][idx][account];
+        uint256 winningPool = m.totalPerOutcome[idx];
         if (stake == 0 || winningPool == 0) return 0;
-        return (stake * (m.totalYes + m.totalNo)) / winningPool;
+
+        uint256 totalPool = 0;
+        uint256 outcomes = m.totalPerOutcome.length;
+        for (uint256 i = 0; i < outcomes; i++) totalPool += m.totalPerOutcome[i];
+
+        return (stake * totalPool) / winningPool;
     }
 
     // ─────────────────────────────── Views ───────────────────────────────
@@ -428,30 +452,34 @@ contract RitualPredict {
         }
     }
 
-    function stakesOf(
+    function outcomeCount(uint256 marketId) external view returns (uint256) {
+        return _market(marketId).totalPerOutcome.length;
+    }
+
+    function stakeAt(
+        uint256 marketId,
+        uint8 outcomeIndex,
+        address account
+    ) external view returns (uint256) {
+        return stakeOf[marketId][outcomeIndex][account];
+    }
+
+    function claimableFor(
         uint256 marketId,
         address account
-    )
-        external
-        view
-        returns (
-            uint256 yes,
-            uint256 no,
-            bool alreadySettled,
-            uint256 claimable
-        )
-    {
+    ) external view returns (uint256 claimable, bool alreadySettled) {
         Market storage m = _market(marketId);
-        (yes, no, alreadySettled) = (
-            yesStake[marketId][account],
-            noStake[marketId][account],
-            settled[marketId][account]
-        );
-        if (alreadySettled) return (yes, no, true, 0);
+        alreadySettled = settled[marketId][account];
+        if (alreadySettled) return (0, true);
 
-        if (m.state == MarketState.Resolved)
+        if (m.state == MarketState.Resolved) {
             claimable = _payout(m, marketId, account);
-        else if (m.state == MarketState.Invalid) claimable = yes + no;
+        } else if (m.state == MarketState.Invalid) {
+            uint256 outcomes = m.totalPerOutcome.length;
+            for (uint8 i = 0; i < outcomes; i++) {
+                claimable += stakeOf[marketId][i][account];
+            }
+        }
     }
 
     // ───────────────────────── Execution funding ─────────────────────────
@@ -613,15 +641,19 @@ contract RitualPredict {
         if (m.closeBlock == 0) revert UnknownMarket();
     }
 
-    function _compare(
+    /// First index i where observed < thresholds[i]; thresholds.length if observed is
+    /// at or above every threshold. thresholds is sorted ascending (enforced at
+    /// creation), so a single linear scan is correct and cheap for the small arrays
+    /// this contract allows (<= MAX_THRESHOLDS).
+    function _bucket(
         uint256 observed,
-        uint256 target,
-        Comparator comparator
-    ) private pure returns (bool) {
-        if (comparator == Comparator.GT) return observed > target;
-        if (comparator == Comparator.GTE) return observed >= target;
-        if (comparator == Comparator.LT) return observed < target;
-        return observed <= target;
+        uint256[] storage thresholds
+    ) private view returns (uint8) {
+        uint256 n = thresholds.length;
+        for (uint256 i = 0; i < n; i++) {
+            if (observed < thresholds[i]) return uint8(i);
+        }
+        return uint8(n);
     }
 
     function _secondsToBlocks(
